@@ -1,8 +1,10 @@
 # mypy: allow-untyped-defs
+import atexit
 import functools
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 import math
 
@@ -64,7 +66,7 @@ aten = torch.ops.aten
 prims = torch.ops.prims
 
 # StreamK configuration
-ENABLE_STREAMK = os.environ.get("TORCHINDUCTOR_ENABLE_STREAMK", "1") == "1"
+ENABLE_STREAMK = os.environ.get("TORCHINDUCTOR_ENABLE_STREAMK", "0") == "1"
 STREAMK_ONLY = os.environ.get("TORCHINDUCTOR_STREAMK_ONLY", "0") == "1"
 STREAMK_DEBUG = os.environ.get("TORCHINDUCTOR_STREAMK_DEBUG", "0") == "1"
 
@@ -105,14 +107,34 @@ def _safe_even_k_check(k, block_k):
         return False
 
 
+@dataclass(frozen=True)
+class OrigamiHardwareInfo:
+    n_cu: int
+    num_xcd: int
+
+
+@functools.lru_cache(maxsize=8)
+def _get_origami_hardware_info(device_index: int = 0) -> OrigamiHardwareInfo:
+    import origami
+    hardware = origami.get_hardware_for_device(device_index)
+    return OrigamiHardwareInfo(
+        n_cu=hardware.N_CU,
+        num_xcd=max(1, getattr(hardware, "NUM_XCD", 1)),
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _get_origami_hardware(device_index: int = 0):
+    import origami
+    return origami.get_hardware_for_device(device_index)
+
+
 def _get_hardware_chiplet_count():
-    """Get actual hardware chiplet count using origami detection"""
+    """Get actual hardware chiplet count using cached Origami metadata."""
     try:
-        import origami
-        hardware = origami.get_hardware_for_device(0)
-        num_xcds = getattr(hardware, 'NUM_XCD', 1)
-        streamk_log_debug(f"hardware detection: num_xcd={num_xcds}")
-        return max(1, num_xcds)  # Ensure at least 1
+        info = _get_origami_hardware_info(0)
+        streamk_log_debug(f"hardware detection: num_xcd={info.num_xcd}")
+        return info.num_xcd
     except (ImportError, AttributeError) as e:
         streamk_log_debug(f"hardware detection failed: {e}; defaulting to 1 chiplet")
         return 1
@@ -154,9 +176,8 @@ class StreamKOrigamiSelector:
         # Get hardware information (tritonBLAS style)
         hw_start = time.perf_counter()
         try:
-            # Try to use origami hardware detection
-            import origami
-            self.hardware = origami.get_hardware_for_device(0)
+            # Try to use cached origami hardware detection.
+            self.hardware = _get_origami_hardware(0)
             self.num_sms = self.hardware.N_CU
             streamk_log_debug(f"using origami hardware detection: num_sms={self.num_sms}")
         except (ImportError, AttributeError) as e:
@@ -633,6 +654,15 @@ def _make_streamk_selector(M, N, K, a_dtype, b_dtype, c_dtype, device_type):
     selector_end = time.perf_counter()
 
     return OrigamiSelectorWrapper(origami_selector)
+
+
+def _clear_streamk_caches() -> None:
+    _get_origami_hardware.cache_clear()
+    _get_origami_hardware_info.cache_clear()
+    _make_streamk_selector.cache_clear()
+
+
+atexit.register(_clear_streamk_caches)
 
 @SymbolicGridFn
 def streamk_mm_grid(m, n, meta, *, cdiv, min):
