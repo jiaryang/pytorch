@@ -75,9 +75,11 @@ def streamk_log_debug(msg):
         log.info("[StreamKDebug] %s", msg)
 
 if ENABLE_STREAMK or STREAMK_DEBUG or STREAMK_ONLY:
-    streamk_log_info(
-        f"module loaded: enabled={ENABLE_STREAMK} "
-        f"streamk_only={STREAMK_ONLY} debug={STREAMK_DEBUG}"
+    log.info(
+        "[StreamK] module loaded: enabled=%s streamk_only=%s debug=%s",
+        ENABLE_STREAMK,
+        STREAMK_ONLY,
+        STREAMK_DEBUG,
     )
 
 def log_choices_summary(choices, problem_desc):
@@ -656,7 +658,35 @@ class StreamKTemplate(TritonTemplate):
             name="mm_streamk",
             grid=streamk_mm_grid,
             source=r"""
+{% if QUANTIZED %}
+{% if BIAS %}
+{% if STREAMK_TILES != 0 %}
 {{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR", "BIAS_PTR", "WORKSPACE", "LOCKS")}}
+{% else %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR", "BIAS_PTR")}}
+{% endif %}
+{% else %}
+{% if STREAMK_TILES != 0 %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR", "WORKSPACE", "LOCKS")}}
+{% else %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR")}}
+{% endif %}
+{% endif %}
+{% else %}
+{% if BIAS %}
+{% if STREAMK_TILES != 0 %}
+{{def_kernel("A", "B", "BIAS_PTR", "WORKSPACE", "LOCKS")}}
+{% else %}
+{{def_kernel("A", "B", "BIAS_PTR")}}
+{% endif %}
+{% else %}
+{% if STREAMK_TILES != 0 %}
+{{def_kernel("A", "B", "WORKSPACE", "LOCKS")}}
+{% else %}
+{{def_kernel("A", "B")}}
+{% endif %}
+{% endif %}
+{% endif %}
     # Matrix dimensions (can vary between calls, so regular variables)
     M = {{size("A", 0)}}
     N = {{size("B", 1)}}
@@ -683,9 +713,13 @@ class StreamKTemplate(TritonTemplate):
     stride_cm = {{stride(None, 0)}}
     stride_cn = {{stride(None, 1)}}
 
+    {% if BIAS %}
     stride_bias: tl.constexpr = {{stride("BIAS_PTR", 0)}}
+    {% endif %}
+    {% if QUANTIZED %}
     stride_a_scale: tl.constexpr = {{stride("A_SCALE_PTR", 0)}}
     stride_b_scale: tl.constexpr = {{stride("B_SCALE_PTR", 0)}}
+    {% endif %}
 
     # Note: BLOCK_M, BLOCK_N, BLOCK_K, NUM_XCDS, etc. are already passed as constexpr by template system
 
@@ -816,9 +850,8 @@ class StreamKTemplate(TritonTemplate):
         C_ = C_OUT + rm[:, None] * stride_cm + rn[None, :] * stride_cn
         tl.store(C_, c, mask=mask)
 
+    {% if STREAMK_TILES != 0 %}
     # ========== Phase 2: Process StreamK Tiles ==========
-    if STREAMK_TILES == 0:
-        return
 
     # Initialize workspace for this SM
     rm1 = tl.arange(0, BLOCK_M)
@@ -1017,6 +1050,7 @@ class StreamKTemplate(TritonTemplate):
             tl.store(C_, c, mask=mask)
 
         start_iter = end_iter
+    {% endif %}
 
     # No store_output needed - all stores happen inside the loops above
     # This is a minimal dummy output point required by the template system
@@ -1084,59 +1118,45 @@ class StreamKTemplate(TritonTemplate):
                 workspace_shape = [1]
                 locks_shape = [1]
 
-            workspace = empty_strided(
-                workspace_shape,
-                None,
-                dtype=torch.float32,
-                device=layout.device,
-            )
-            locks = empty_strided(
-                locks_shape,
-                None,
-                dtype=torch.int32,
-                device=layout.device,
-            )
-            streamk_log_debug(f"workspace buffers: workspace={workspace_shape} locks={locks_shape}")
+            streamk_input_nodes = [A_node, B_node]
+            mutated_inputs = []
 
             if is_quantized:
                 a_scale = empty_strided(
-                    [M],  # Row-wise scaling for A
+                    [M],
                     None,
                     dtype=torch.float32,
                     device=layout.device,
                 )
                 b_scale = empty_strided(
-                    [N],  # Column-wise scaling for B
+                    [N],
                     None,
                     dtype=torch.float32,
                     device=layout.device,
                 )
-            else:
-                a_scale = empty_strided(
-                    [1],  # Minimal size
-                    None,
-                    dtype=torch.float32,
-                    device=layout.device,
-                )
-                b_scale = empty_strided(
-                    [1],  # Minimal size
-                    None,
-                    dtype=torch.float32,
-                    device=layout.device,
-                )
+                streamk_input_nodes.extend((a_scale, b_scale))
 
             if has_bias:
-                streamk_input_nodes = (A_node, B_node, a_scale, b_scale, bias_node, workspace, locks)
-            else:
-                dummy_bias = empty_strided(
-                    [1],  # Minimal size
+                streamk_input_nodes.append(bias_node)
+
+            if streamk_tiles > 0:
+                workspace = empty_strided(
+                    workspace_shape,
                     None,
-                    dtype=layout.dtype,
+                    dtype=torch.float32,
                     device=layout.device,
                 )
-                streamk_input_nodes = (A_node, B_node, a_scale, b_scale, dummy_bias, workspace, locks)
+                locks = empty_strided(
+                    locks_shape,
+                    None,
+                    dtype=torch.int32,
+                    device=layout.device,
+                )
+                streamk_log_debug(f"workspace buffers: workspace={workspace_shape} locks={locks_shape}")
+                streamk_input_nodes.extend((workspace, locks))
+                mutated_inputs = [workspace, locks]
 
-            mutated_inputs = [workspace, locks]
+            streamk_input_nodes = tuple(streamk_input_nodes)
 
             template_kwargs.pop('epilogue_fn', None)
             template_kwargs.pop('epilogue_fn_hash', None)

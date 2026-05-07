@@ -672,8 +672,9 @@ class TritonTemplateKernel(TritonKernel):
         for name, input_node in zip(argnames, named_args):
             arg_name = f"arg_{name}"
             self.named_input_nodes[name] = input_node
-            if input_node.get_name() in V.graph.removed_buffers:
-                continue
+            # Explicit template args must always be bound if the template names them.
+            # Some templates, such as StreamK, pass auxiliary buffers that may be marked
+            # removed from the graph but are still required by the kernel body.
             if input_node.get_name() in self.prologue_fused_inputs:
                 continue
 
@@ -684,8 +685,6 @@ class TritonTemplateKernel(TritonKernel):
             input_node = self.named_input_nodes[name]
             if self.prologue_loads_all_inputs:
                 self.prologue_supported_inputs.add(input_node.get_name())
-            if input_node.get_name() in V.graph.removed_buffers:
-                continue
             if input_node.get_name() in self.prologue_fused_inputs:
                 continue
 
