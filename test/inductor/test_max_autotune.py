@@ -112,6 +112,76 @@ class FailChoiceCaller(ChoiceCaller):
 @config.patch(enable_caching_generated_triton_templates=True)
 @instantiate_parametrized_tests
 class TestMaxAutotune(TestCase):
+    def test_streamk_autotune_config_variants(self):
+        from torch._inductor.kernel import mm as mm_kernel
+
+        base_config = {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_M": 8,
+            "STREAMK_TILES": 16,
+            "NUM_SMS": 120,
+            "EVEN_K": True,
+            "ACC_TYPE": "tl.float32",
+            "ALLOW_TF32": True,
+            "CACHE_MODIFIER_A": None,
+            "CACHE_MODIFIER_B": None,
+            "CHUNK_SIZE": 16,
+            "NUM_XCDS": 1,
+            "BIAS": False,
+            "INPUT_PRECISION": None,
+            "OUTPUT_DTYPE_IS_INT8": False,
+            "QUANTIZED": False,
+            "USE_FAST_ACCUM": True,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        }
+        non_streamk_config = dict(base_config)
+        non_streamk_config["STREAMK_TILES"] = 0
+
+        with mock.patch.object(mm_kernel, "STREAMK_AUTOTUNE", False):
+            self.assertEqual(mm_kernel._get_streamk_autotune_configs(base_config), [])
+
+        with mock.patch.object(mm_kernel, "STREAMK_AUTOTUNE", True):
+            non_streamk_configs = mm_kernel._get_streamk_autotune_configs(
+                non_streamk_config
+            )
+            configs = mm_kernel._get_streamk_autotune_configs(base_config)
+
+        self.assertIs(
+            mm_kernel._get_streamk_template(0), mm_kernel.mm_streamk_nosplit_template
+        )
+        self.assertIs(
+            mm_kernel._get_streamk_template(1), mm_kernel.mm_streamk_split_template
+        )
+        self.assertEqual(len(non_streamk_configs), 3)
+        self.assertEqual(len(configs), 3)
+        self.assertEqual(
+            len({tuple(sorted(config.items())) for config in configs}),
+            len(configs),
+        )
+
+        for config in configs:
+            self.assertEqual(config["BLOCK_M"], base_config["BLOCK_M"])
+            self.assertEqual(config["BLOCK_N"], base_config["BLOCK_N"])
+            self.assertEqual(config["BLOCK_K"], base_config["BLOCK_K"])
+            self.assertEqual(config["STREAMK_TILES"], base_config["STREAMK_TILES"])
+            self.assertEqual(config["NUM_SMS"], base_config["NUM_SMS"])
+
+        self.assertEqual({config["num_warps"] for config in configs}, {4, 8})
+        self.assertEqual(sorted(config["num_stages"] for config in configs), [1, 2, 2])
+        self.assertEqual(sorted(config["waves_per_eu"] for config in configs), [0, 0, 1])
+        self.assertTrue(
+            all(
+                config["STREAMK_TILES"] == non_streamk_config["STREAMK_TILES"]
+                for config in non_streamk_configs
+            )
+        )
+
     @parametrize("dynamic", (False, True))
     def test_max_autotune_mm_plus_mm_zero_size_input(self, dynamic):
         """

@@ -1,10 +1,15 @@
 # mypy: allow-untyped-defs
+import atexit
 import functools
 import logging
+import os
+import time
+from dataclasses import dataclass
 from typing import Any, Optional
+import math
 
 import torch
-from torch._dynamo.utils import counters
+from torch._dynamo.utils import counters, identity
 from torch._inductor.autoheuristic.autoheuristic import AutoHeuristicSelectAlgorithm
 from torch._inductor.autoheuristic.autoheuristic_utils import (
     AHContext,
@@ -19,17 +24,19 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.torch_version import TorchVersion
 
 from .. import config as inductor_config
+from ..codegen.common import WorkspaceArg, WorkspaceZeroMode
 from ..codegen.cuda.gemm_template import CUTLASS2xGemmTemplate, CUTLASS3xGemmTemplate
 from ..codegen.rocm.ck_tile_universal_gemm_template import CKTileGemmTemplate
 from ..codegen.rocm.ck_universal_gemm_template import CKGemmTemplate
 from ..codegen.subgraph import SubgraphChoiceCaller, SubgraphTemplate
 from ..ir import Buffer, ChoiceCaller, FlexibleLayout, is_triton, Layout
 from ..kernel_inputs import MMKernelInputs
-from ..lowering import add_layout_constraint, constrain_to_fx_strides, register_lowering
+from ..lowering import add_layout_constraint, constrain_to_fx_strides, register_lowering, empty_strided
 from ..select_algorithm import (
     autotune_select_algorithm,
     ExternKernelChoice,
     realize_inputs,
+    SymbolicGridFn,
     TritonTemplate,
 )
 from ..utils import (
@@ -58,6 +65,1230 @@ except ImportError:
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
+
+# StreamK configuration
+ENABLE_STREAMK = os.environ.get("TORCHINDUCTOR_ENABLE_STREAMK", "0") == "1"
+STREAMK_AUTOTUNE = os.environ.get("TORCHINDUCTOR_STREAMK_AUTOTUNE", "0") == "1"
+STREAMK_ONLY = os.environ.get("TORCHINDUCTOR_STREAMK_ONLY", "0") == "1"
+STREAMK_DEBUG = os.environ.get("TORCHINDUCTOR_STREAMK_DEBUG", "0") == "1"
+
+def streamk_log_info(msg):
+    log.info("[StreamKInfo] %s", msg)
+def streamk_log_debug(msg):
+    if STREAMK_DEBUG:
+        log.info("[StreamKDebug] %s", msg)
+
+if ENABLE_STREAMK or STREAMK_AUTOTUNE or STREAMK_DEBUG or STREAMK_ONLY:
+    log.info(
+        "[StreamK] module loaded: enabled=%s autotune=%s streamk_only=%s debug=%s",
+        ENABLE_STREAMK,
+        STREAMK_AUTOTUNE,
+        STREAMK_ONLY,
+        STREAMK_DEBUG,
+    )
+
+def log_choices_summary(choices, problem_desc):
+    """Log summary of all choices for debugging"""
+    if STREAMK_DEBUG:
+        streamk_log_debug(f"Choice summary for {problem_desc}:")
+        choice_types = {}
+        for choice in choices:
+            choice_name = getattr(choice, 'name', str(type(choice).__name__))
+            choice_types[choice_name] = choice_types.get(choice_name, 0) + 1
+
+        for choice_type, count in sorted(choice_types.items()):
+            streamk_log_debug(f"  - {choice_type}: {count} configs")
+        streamk_log_debug(f"Total choices: {len(choices)}")
+
+
+def _safe_even_k_check(k, block_k):
+    """Safely check if K is evenly divisible by block_k, handling symbolic variables"""
+    try:
+        return k % block_k == 0
+    except (TypeError, AttributeError):
+        # Symbolic variable - assume it might not be even
+        return False
+
+
+@dataclass(frozen=True)
+class OrigamiHardwareInfo:
+    n_cu: int
+    num_xcd: int
+
+
+@functools.lru_cache(maxsize=8)
+def _get_origami_hardware_info(device_index: int = 0) -> OrigamiHardwareInfo:
+    import origami
+    hardware = origami.get_hardware_for_device(device_index)
+    return OrigamiHardwareInfo(
+        n_cu=hardware.N_CU,
+        num_xcd=max(1, getattr(hardware, "NUM_XCD", 1)),
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _get_origami_hardware(device_index: int = 0):
+    import origami
+    return origami.get_hardware_for_device(device_index)
+
+
+def _get_hardware_chiplet_count():
+    """Get actual hardware chiplet count using cached Origami metadata."""
+    try:
+        info = _get_origami_hardware_info(0)
+        streamk_log_debug(f"hardware detection: num_xcd={info.num_xcd}")
+        return info.num_xcd
+    except (ImportError, AttributeError) as e:
+        streamk_log_debug(f"hardware detection failed: {e}; defaulting to 1 chiplet")
+        return 1
+
+
+class StreamKOrigamiSelector:
+    """Origami-based selector for StreamK configuration following tritonBLAS pattern"""
+
+    # Dtype to string mapping (from tritonBLAS)
+    dtype_to_str = {
+        torch.float32: "f32",
+        torch.complex64: "c32",
+        torch.complex128: "c64",
+        torch.float64: "f64",
+        torch.float16: "f16",
+        torch.int32: "i32",
+        torch.bfloat16: "bf16",
+        torch.int8: "i8",
+        torch.float8_e5m2: "f8",
+        torch.float8_e4m3fn: "f8",
+    }
+    # Add FP8 FNUZ variants if available
+    if hasattr(torch, "float8_e5m2fnuz"):
+        dtype_to_str[torch.float8_e5m2fnuz] = "f8"
+    if hasattr(torch, "float8_e4m3fnuz"):
+        dtype_to_str[torch.float8_e4m3fnuz] = "f8"
+
+    def __init__(self, M, N, K, a_dtype, b_dtype, c_dtype, device):
+        init_start = time.perf_counter()
+        streamk_log_debug(f"initializing origami selector for {M}x{N}x{K}")
+        self.M = M
+        self.N = N
+        self.K = K
+        self.a_dtype = a_dtype
+        self.b_dtype = b_dtype
+        self.c_dtype = c_dtype
+        self.device = device
+
+        # Get hardware information (tritonBLAS style)
+        hw_start = time.perf_counter()
+        try:
+            # Try to use cached origami hardware detection.
+            self.hardware = _get_origami_hardware(0)
+            self.num_sms = self.hardware.N_CU
+            streamk_log_debug(f"using origami hardware detection: num_sms={self.num_sms}")
+        except (ImportError, AttributeError) as e:
+            # Fallback to CUDA device properties
+            streamk_log_debug(f"origami hardware detection failed: {e}; falling back to CUDA")
+            try:
+                if torch.cuda.is_available() and hasattr(device, 'index'):
+                    props = torch.cuda.get_device_properties(device.index)
+                    self.num_sms = props.multi_processor_count
+                    # Create mock hardware object for compatibility
+                    self.hardware = type('Hardware', (), {'N_CU': self.num_sms})()
+                    streamk_log_debug(f"using CUDA device properties: num_sms={self.num_sms}")
+                else:
+                    self.num_sms = 108  # Default fallback
+                    self.hardware = type('Hardware', (), {'N_CU': 108})()
+                    streamk_log_debug("using default num_sms=108")
+            except Exception as e2:
+                self.num_sms = 108
+                self.hardware = type('Hardware', (), {'N_CU': 108})()
+                streamk_log_debug(f"CUDA detection failed: {e2}; using default num_sms=108")
+
+        # Initialize configuration ranges (from tritonBLAS)
+        self.block_mn_range = [16, 32, 64, 128, 256]
+        self.block_k_range = [16, 32, 64, 128, 256, 512]
+
+        # Get element sizes and infer MI dimensions
+        self.element_size_A = self._get_dtype_bits(a_dtype)
+        self.element_size_B = self._get_dtype_bits(b_dtype)
+        self.element_size_out = self._get_dtype_bits(c_dtype)
+
+        # Set MI dtype - use input dtype for matrix instruction type
+        input_dtype_for_mi = a_dtype if self._get_dtype_bits(a_dtype) <= self._get_dtype_bits(b_dtype) else b_dtype
+        self.mi_dtype = self.dtype_to_str.get(input_dtype_for_mi, self.dtype_to_str.get(c_dtype))
+
+        # Infer Matrix Instruction Dimensions (tritonBLAS style)
+        self.MI_dim = self._infer_matrix_instruction_dimensions(self.element_size_A, self.element_size_B)
+
+        # StreamK grid constants (from tritonBLAS)
+        self.split_factors = [8, 6, 4, 3, 2, 1]
+        self.tile_fractions = [0.0, 1.0/2.0, 1.0/8.0, 1.0/5.0, 1.0/4.0, 1.0/3.0]
+        self.max_workspace = 128 * 1024 * 1024
+
+        hw_end = time.perf_counter()
+
+        # Compute optimal configuration and grid
+        config_start = time.perf_counter()
+        self.config = self._compute_optimal_config()
+        config_end = time.perf_counter()
+
+        grid_start = time.perf_counter()
+        self.grid = self._compute_streamk_grid()
+        grid_end = time.perf_counter()
+
+        init_end = time.perf_counter()
+        streamk_log_debug(f"final selector config: block_m={self.config[0]} block_n={self.config[1]} block_k={self.config[2]} group_m={self.config[3]} grid={self.grid}")
+
+    def _get_dtype_bits(self, dtype):
+        """Get bits for torch dtypes"""
+        try:
+            return torch.finfo(dtype).bits
+        except TypeError:
+            return torch.iinfo(dtype).bits
+
+    def _infer_matrix_instruction_dimensions(self, element_size_A, element_size_B):
+        """Infer MI dimensions based on hardware and data types (from tritonBLAS)"""
+        MI_dim = None
+        is_gfx942 = self.hardware.N_CU in [304, 80, 64]
+
+        # gfx950
+        if self.hardware.N_CU == 256:
+            if max(element_size_A, element_size_B) == 32:  # FP32
+                MI_dim = [16, 16, 4]
+            elif max(element_size_A, element_size_B) == 16:  # FP16/BF16
+                MI_dim = [16, 16, 32]
+            elif max(element_size_A, element_size_B) <= 8:  # F4F6F8
+                if hasattr(self.K, '__mod__') and self.K % 256 == 0:
+                    self.block_k_range = [256]
+                else:
+                    self.block_k_range = [128]
+                self.block_mn_range = [32, 64, 128, 256]
+                MI_dim = [16, 16, 128]
+
+        # gfx942 (304 CUs full, 80 CUs partitioned)
+        elif is_gfx942:
+            if max(element_size_A, element_size_B) == 32:  # FP32
+                MI_dim = [16, 16, 4]
+            elif max(element_size_A, element_size_B) == 16:  # FP16/BF16
+                MI_dim = [16, 16, 16]
+            elif max(element_size_A, element_size_B) == 8:  # F8
+                MI_dim = [16, 16, 32]
+                self.block_mn_range = self.block_mn_range + [512]
+                self.block_k_range = self.block_k_range + [128, 256]
+            elif max(element_size_A, element_size_B) < 8:  # F4F6
+                raise ValueError("gfx942 doesn't support F4/F6")
+
+        # gfx942 228 CUs
+        elif self.hardware.N_CU == 228:
+            if max(element_size_A, element_size_B) == 32:  # FP32
+                MI_dim = [16, 16, 4]
+            elif max(element_size_A, element_size_B) == 16:  # FP16/BF16
+                MI_dim = [16, 16, 16]
+            elif max(element_size_A, element_size_B) == 8:  # F8
+                MI_dim = [16, 16, 32]
+                self.block_mn_range = self.block_mn_range + [512]
+                self.block_k_range = self.block_k_range + [128, 256]
+            elif max(element_size_A, element_size_B) < 8:  # F4F6
+                raise ValueError("gfx942 228CUs doesn't support F4/F6")
+
+        # gfx90s 104 CUs
+        elif self.hardware.N_CU == 104:
+            if max(element_size_A, element_size_B) == 32:  # FP32
+                MI_dim = [16, 16, 4]
+            elif max(element_size_A, element_size_B) == 16:  # FP16/BF16
+                MI_dim = [16, 16, 16]
+            elif max(element_size_A, element_size_B) == 8:  # F8
+                raise ValueError("gfx90s doesn't support F8")
+            elif max(element_size_A, element_size_B) < 8:  # F4F6
+                raise ValueError("gfx90s doesn't support F4/F6")
+
+        # Default fallback for unknown architectures
+        if MI_dim is None:
+            if max(element_size_A, element_size_B) == 32:
+                MI_dim = [16, 16, 4]
+            elif max(element_size_A, element_size_B) == 16:
+                MI_dim = [16, 16, 16]
+            else:
+                MI_dim = [16, 16, 32]
+
+        return MI_dim
+
+    def _compute_optimal_config(self):
+        """Compute optimal tile configuration using tritonBLAS-style selection"""
+        try:
+            # Try to use origami for optimal tile selection
+            import origami
+            tiles_start = time.perf_counter()
+            valid_tiles = self._get_valid_tiles()
+            tiles_end = time.perf_counter()
+
+            macro_start = time.perf_counter()
+            results = origami.select_best_macro_tile_size(
+                self.M, self.N, self.K,
+                1,  # Batch
+                True,  # transA
+                False,  # transB
+                self.hardware,
+                valid_tiles,
+                self.element_size_A,
+                self.element_size_B,
+                self.element_size_out,
+                origami.string_to_datatype(self.mi_dtype),
+                0,  # MX Block Size
+                0.8,  # H_L2
+                False,  # debug
+                False,  # Print
+                6,  # WGM
+            )
+            macro_end = time.perf_counter()
+
+            best_result = results[0]
+
+            # Heuristic weighting for gfx942
+            if self.hardware.N_CU in [304, 80, 64]:
+                if best_result[1] == 256 and best_result[2] == 256:
+                    if results[0][0] * 1.00 > results[1][0]:
+                        best_result = results[1]
+
+            BLK_M, BLK_N, BLK_K = best_result[1], best_result[2], best_result[3]
+
+            # Triton requires tl.arange ranges to be powers of 2.
+            # Round down any non-power-of-2 tile sizes from origami.
+            def _round_down_pow2(v):
+                if v <= 0:
+                    return 16
+                p = 1
+                while p * 2 <= v:
+                    p *= 2
+                return p
+
+            if BLK_M & (BLK_M - 1) != 0:
+                BLK_M = _round_down_pow2(BLK_M)
+            if BLK_N & (BLK_N - 1) != 0:
+                BLK_N = _round_down_pow2(BLK_N)
+
+            # Apply more accurate shared memory constraints matching tritonBLAS behavior
+            # Real hardware limit is 65536 bytes, but tritonBLAS successfully uses larger tiles
+            max_shared_memory = 65536
+
+            # More accurate shared memory estimation:
+            # - Only count A_shared (BLK_M * BLK_K) and B_shared (BLK_K * BLK_N) tiles
+            # - Account for proper data types and padding
+            element_size = 2 if self.a_dtype in (torch.float16, torch.bfloat16) else 4
+            a_shared_size = BLK_M * BLK_K * element_size
+            b_shared_size = BLK_K * BLK_N * element_size
+
+            # Add minimal overhead (not the inflated 4KB I used before)
+            padding_overhead = 1024  # 1KB for alignment and miscellaneous
+            estimated_usage = a_shared_size + b_shared_size + padding_overhead
+
+            # Since tritonBLAS succeeds with 256x256x64 (estimated ~67KB), be less conservative
+            # Only reduce if we're significantly over the limit
+            if estimated_usage > max_shared_memory * 1.1:  # 10% tolerance
+                streamk_log_debug(f"shared memory constraint: {estimated_usage} > {max_shared_memory*1.1:.0f}; reducing block sizes")
+                streamk_log_debug(f"shared memory details: a_shared={a_shared_size} b_shared={b_shared_size} overhead={padding_overhead}")
+
+                # Go directly to 128x128 (must be power of 2 for tl.arange)
+                if estimated_usage > max_shared_memory * 1.05:  # 5% tolerance
+                    if self.a_dtype in (torch.float16, torch.bfloat16):
+                        BLK_M, BLK_N = 128, 128
+                        BLK_K = 32
+                    else:
+                        BLK_M, BLK_N = 64, 64
+                        BLK_K = 32
+                streamk_log_debug(f"adjusted blocks: block_m={BLK_M} block_n={BLK_N} block_k={BLK_K}")
+            else:
+                streamk_log_debug(f"shared memory OK: {estimated_usage} <= {max_shared_memory*1.1:.0f}")
+
+            # Get optimal group size
+            try:
+                wgm_start = time.perf_counter()
+                group_m_results = origami.select_best_wgm(
+                    self.M, self.N, self.K, 1, self.hardware,
+                    BLK_M, BLK_N, BLK_K,
+                    self.MI_dim[0], self.MI_dim[1], self.MI_dim[2],
+                    [1, 2, 4, 6, 8],
+                    self.element_size_A,
+                    0.8, False, False
+                )
+                wgm_end = time.perf_counter()
+                group_m = group_m_results[1]
+            except:
+                group_m = 8 if (BLK_M >= 128 and BLK_N >= 128) else 4
+
+        except (ImportError, AttributeError, Exception) as e:
+            # Fallback to heuristic-based selection
+            log.debug(f"Origami optimization failed: {e}, using heuristics")
+
+            # Select block sizes based on problem size and dtype - conservative for shared memory
+            if self.a_dtype in (torch.float16, torch.bfloat16):
+                if self.M >= 2048 and self.N >= 2048:
+                    BLK_M, BLK_N = 128, 128  # Reduced from 256,128 for shared memory
+                    BLK_K = 32  # Reduced from 64 for shared memory
+                elif self.M >= 1024 and self.N >= 1024:
+                    BLK_M, BLK_N = 128, 128
+                    BLK_K = 32
+                else:
+                    BLK_M, BLK_N = 64, 64
+                    BLK_K = 32
+            elif self.a_dtype == torch.float32:
+                if self.M >= 1024 and self.N >= 1024:
+                    BLK_M, BLK_N = 64, 64  # Reduced for FP32
+                    BLK_K = 16
+                else:
+                    BLK_M, BLK_N = 64, 64
+                    BLK_K = 16
+            else:
+                BLK_M, BLK_N = 64, 64
+                BLK_K = 32
+
+            group_m = 8 if (BLK_M >= 128 and BLK_N >= 128) else 4
+
+        return (BLK_M, BLK_N, BLK_K, group_m)
+
+    def _get_valid_tiles(self):
+        """Get valid tile configurations for origami"""
+        import itertools
+        return list(itertools.product(
+            self.block_mn_range,
+            self.block_mn_range,
+            self.block_k_range,
+            [self.MI_dim[0]],  # MI_M
+            [self.MI_dim[1]],  # MI_N
+            [self.MI_dim[2]],  # MI_K
+            [1],  # kernel_occupancy
+        ))
+
+    def _compute_streamk_grid(self):
+        """Compute StreamK grid size following tritonBLAS logic"""
+        BLK_M, BLK_N, BLK_K, _ = self.config
+
+        # Calculate total tiles
+        tiles_m = math.ceil(self.M / BLK_M) if hasattr(self.M, '__truediv__') else (self.M + BLK_M - 1) // BLK_M
+        tiles_n = math.ceil(self.N / BLK_N) if hasattr(self.N, '__truediv__') else (self.N + BLK_N - 1) // BLK_N
+        total_tiles = tiles_m * tiles_n
+
+        # StreamK grid computation (from tritonBLAS origami.py:301)
+        sk_grid = total_tiles
+        iters_per_tile = max(1, math.ceil(self.K / BLK_K) if hasattr(self.K, '__truediv__') else (self.K + BLK_K - 1) // BLK_K)
+
+        # More tiles than CUs: try fractional splits to distribute work
+        if total_tiles > self.num_sms:
+            virt_cu_count = self.num_sms
+            min_even_tiles = total_tiles / virt_cu_count
+
+            for frac in self.tile_fractions:
+                # Compute candidate grid with rounding
+                frac_grid = int((total_tiles / (min_even_tiles + frac)) + 0.5)
+
+                # Skip if this split leaves a remainder AND workspace is too large
+                if (total_tiles % frac_grid != 0 and
+                    self._partial_tile_size(frac_grid) > self.max_workspace):
+                    continue
+
+                # Accept the first grid no larger than the virtual CU count
+                if frac_grid <= virt_cu_count:
+                    sk_grid = frac_grid
+                    break
+
+        # Fewer tiles than CUs
+        elif total_tiles < self.num_sms:
+            total_iters = total_tiles * iters_per_tile
+            min_iters_per_cu = 4
+            if total_iters >= self.num_sms * min_iters_per_cu:
+                # Enough K-work: use all CUs (same as 'after' baseline)
+                sk_grid = self.num_sms
+            else:
+                # Tiny problem: 1 WG per tile to avoid serializing tiles
+                # within WGs (reference: TritonBLAS uses total_tiles)
+                sk_grid = total_tiles
+
+        # Only revert if workspace would exceed budget
+        if total_tiles % sk_grid != 0:
+            partial_ws = self._partial_tile_size(sk_grid)
+            if partial_ws > self.max_workspace:
+                sk_grid = total_tiles
+
+        # Last wave optimization for gfx942
+        if total_tiles >= self.hardware.N_CU:
+            last_wave_remainder = total_tiles % self.hardware.N_CU
+
+            if (last_wave_remainder < 128 and last_wave_remainder > 0 and
+                self.hardware.N_CU in [304, 80, 64]):  # gfx942
+                sk_grid = 256 if self.hardware.N_CU == 304 else 64
+
+        return sk_grid
+
+    def _partial_tile_size(self, sk_grid):
+        """Compute partial tile size for workspace calculation"""
+        BLK_M, BLK_N, _, _ = self.config
+        bytes_per_elem = self.element_size_out // 8
+        tile_size = BLK_M * BLK_N * bytes_per_elem
+        return tile_size * sk_grid
+
+    def get_config(self):
+        """Return (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M)"""
+        return self.config
+
+    def get_grid(self):
+        """Return optimal StreamK grid size"""
+        return self.grid
+
+
+# LRU cache for origami selector following tritonBLAS pattern
+@functools.lru_cache(maxsize=1024)
+def _make_streamk_selector(M, N, K, a_dtype, b_dtype, c_dtype, device_type):
+    """Create cached origami selector following tritonBLAS pattern"""
+    selector_start = time.perf_counter()
+    streamk_log_debug(f"creating selector cache entry for {M}x{N}x{K}")
+
+    # Create a dummy device object for the selector
+    device = torch.device(device_type)
+    # Use the origami-based selector instead of the simple heuristic one
+    origami_selector = StreamKOrigamiSelector(M, N, K, a_dtype, b_dtype, c_dtype, device)
+
+    wrapper_start = time.perf_counter()
+
+    # Normalize selector output into template kwargs.
+    class OrigamiSelectorWrapper:
+        def __init__(self, origami_selector):
+            self.origami_selector = origami_selector
+
+        def get_config(self):
+            # Get config from origami selector and convert to expected format
+            block_m, block_n, block_k, group_m = self.origami_selector.get_config()
+            grid = self.origami_selector.get_grid()
+
+            # Calculate total tiles for TritonBLAS-aligned STREAMK_TILES logic
+            import math
+            total_tiles_m = math.ceil(self.origami_selector.M / block_m)
+            total_tiles_n = math.ceil(self.origami_selector.N / block_n)
+            total_tiles = total_tiles_m * total_tiles_n
+
+            # Enable K-splitting only for truly K-dominant problems:
+            # (1) very few spatial tiles vs CUs, (2) enough total K-iters,
+            # (3) K >> max(M, N) so the problem is memory-bandwidth limited
+            #     on spatial dims (reference: hipBLASLt parallel reduction)
+            iters_per_tile = math.ceil(self.origami_selector.K / block_k)
+            cu_count = self.origami_selector.num_sms
+            K_ = self.origami_selector.K
+            M_ = self.origami_selector.M
+            N_ = self.origami_selector.N
+            k_dominant = K_ >= 4 * max(M_, N_)
+            if total_tiles * 4 <= cu_count and k_dominant and total_tiles * iters_per_tile >= cu_count * 2:
+                # K-dominant: all tiles need K-splitting across excess CUs
+                streamk_tiles = total_tiles
+                # Compute grid with power-of-2 split factor for tree reduction
+                grid = total_tiles  # fallback
+                for factor in [8, 4, 2, 1]:
+                    split_grid = total_tiles * factor
+                    iters_per_wg = iters_per_tile // factor
+                    if split_grid <= cu_count and iters_per_wg >= 8:
+                        grid = split_grid
+                        break
+            else:
+                streamk_tiles = 0
+
+            # If origami picked tiny blocks that fill all CUs but K is large,
+            # override with larger blocks to enable K-splitting.
+            # (hipBLASLt uses large tiles + K-splitting for K-dominant shapes)
+            if streamk_tiles == 0 and k_dominant and total_tiles >= grid:
+                # Try block sizes from large to small (larger tiles have
+                # better MFMA compute efficiency on MI300X).
+                for try_bm, try_bn, try_bk in [(128, 128, 64), (64, 64, 64), (64, 32, 64)]:
+                    t_m = math.ceil(M_ / try_bm)
+                    t_n = math.ceil(N_ / try_bn)
+                    t_tiles = t_m * t_n
+                    t_iters = math.ceil(K_ / try_bk)
+                    if t_tiles * 4 > cu_count or t_tiles * t_iters < cu_count * 2:
+                        continue
+                    block_m, block_n, block_k = try_bm, try_bn, try_bk
+                    total_tiles = t_tiles
+                    iters_per_tile = t_iters
+                    group_m = 8 if (block_m >= 128 and block_n >= 128) else 4
+                    streamk_tiles = total_tiles
+                    # Compute grid with split-factor logic (power-of-2 for
+                    # tree reduction).  Each WG needs >= 8 K-iters so
+                    # compute dominates over workspace overhead.
+                    grid = t_tiles
+                    for factor in [8, 4, 2, 1]:
+                        split_grid = t_tiles * factor
+                        iters_per_wg = t_iters // factor
+                        if split_grid <= cu_count and iters_per_wg >= 8:
+                            grid = split_grid
+                            break
+                    break
+            streamk_log_debug("k-split policy")
+            streamk_log_debug(f"  total_tiles={total_tiles} grid={grid} iters_per_tile={iters_per_tile}")
+            streamk_log_debug(f"  block_m={block_m} block_n={block_n} block_k={block_k}")
+            streamk_log_debug(f"  streamk_tiles={streamk_tiles}")
+
+            config = {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "BLOCK_K": block_k,
+                "GROUP_M": group_m,
+                "STREAMK_TILES": streamk_tiles,
+                "NUM_SMS": grid,
+                "EVEN_K": _safe_even_k_check(self.origami_selector.K, block_k),
+                "ACC_TYPE": "tl.float32",
+                "ALLOW_TF32": True,
+                "CACHE_MODIFIER_A": None,  # TritonBLAS-aligned
+                "CACHE_MODIFIER_B": None,  # TritonBLAS-aligned
+                "CHUNK_SIZE": max(1, min(4 * 4, grid // _get_hardware_chiplet_count())),  # TritonBLAS-aligned, min 1 to avoid div-by-zero
+                "NUM_XCDS": _get_hardware_chiplet_count(),
+                "BIAS": False,
+                "INPUT_PRECISION": None,
+                "OUTPUT_DTYPE_IS_INT8": False,
+                "QUANTIZED": False,
+                "USE_FAST_ACCUM": True,
+                # Use tritonBLAS fixed settings to avoid shared memory issues
+                "num_warps": 8,        # Fixed like tritonBLAS (not dynamic)
+                "num_stages": 2,       # Fixed like tritonBLAS (always 2, never 3)
+                "waves_per_eu": 0,     # Fixed like tritonBLAS
+                "matrix_instr_nonkdim": 16,  # Fixed like tritonBLAS (mfmaInstrSize)
+                "kpack": 1,            # Fixed like tritonBLAS
+            }
+            streamk_log_debug(f"selector config: {config}")
+            return config
+
+        def get_grid(self):
+            return self.origami_selector.get_grid()
+
+    wrapper_end = time.perf_counter()
+    selector_end = time.perf_counter()
+
+    return OrigamiSelectorWrapper(origami_selector)
+
+
+def _clear_streamk_caches() -> None:
+    _get_origami_hardware.cache_clear()
+    _get_origami_hardware_info.cache_clear()
+    _make_streamk_selector.cache_clear()
+
+
+atexit.register(_clear_streamk_caches)
+
+
+def _get_streamk_autotune_configs(
+    selected_config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return a few nearby StreamK configs to benchmark against the Origami pick."""
+    if not STREAMK_AUTOTUNE:
+        return []
+
+    base_num_warps = int(selected_config.get("num_warps", 8))
+    base_num_stages = int(selected_config.get("num_stages", 2))
+    base_waves_per_eu = int(selected_config.get("waves_per_eu", 0))
+
+    variant_overrides = [
+        {"num_warps": 4 if base_num_warps != 4 else 8},
+        {"num_stages": 1 if base_num_stages != 1 else 2},
+        {"waves_per_eu": 1 if base_waves_per_eu != 1 else 2},
+    ]
+
+    seen = {tuple(sorted(selected_config.items()))}
+    configs: list[dict[str, Any]] = []
+    for overrides in variant_overrides:
+        config = dict(selected_config)
+        config.update(overrides)
+        config_key = tuple(sorted(config.items()))
+        if config_key in seen:
+            continue
+        seen.add(config_key)
+        configs.append(config)
+
+    streamk_log_debug(
+        f"generated {len(configs)} additional StreamK autotune configs"
+    )
+    return configs
+
+@SymbolicGridFn
+def streamk_mm_grid(m, n, meta, *, cdiv, min):
+    """Launch NUM_SMS workgroups so every CU is occupied.
+    Phase 1 naturally handles the case where pid >= total_tiles
+    by looping zero times."""
+    num_sms = meta.get("NUM_SMS", 108)
+    return (num_sms, 1, 1)
+
+
+_STREAMK_DEF_KERNEL_WITH_WORKSPACE = r"""
+{% if QUANTIZED %}
+{% if BIAS %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR", "BIAS_PTR")}}
+{% else %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR")}}
+{% endif %}
+{% else %}
+{% if BIAS %}
+{{def_kernel("A", "B", "BIAS_PTR")}}
+{% else %}
+{{def_kernel("A", "B")}}
+{% endif %}
+{% endif %}
+"""
+
+_STREAMK_DEF_KERNEL_WITHOUT_WORKSPACE = r"""
+{% if QUANTIZED %}
+{% if BIAS %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR", "BIAS_PTR")}}
+{% else %}
+{{def_kernel("A", "B", "A_SCALE_PTR", "B_SCALE_PTR")}}
+{% endif %}
+{% else %}
+{% if BIAS %}
+{{def_kernel("A", "B", "BIAS_PTR")}}
+{% else %}
+{{def_kernel("A", "B")}}
+{% endif %}
+{% endif %}
+"""
+
+_STREAMK_SPLIT_PHASE_SOURCE = r"""
+    # ========== Phase 2: Process StreamK Tiles ==========
+
+    # Initialize workspace for this SM
+    WORKSPACE = tl.cast(ws_ptr, tl.pointer_type(tl.float32))
+    LOCKS = tl.cast(
+        ws_ptr + (NUM_SMS * BLOCK_M * BLOCK_N * 4),
+        tl.pointer_type(tl.int32),
+    )
+    rm1 = tl.arange(0, BLOCK_M)
+    rn1 = tl.arange(0, BLOCK_N)
+    rm1 = tl.max_contiguous(tl.multiple_of(rm1, BLOCK_M), BLOCK_M)
+    rn1 = tl.max_contiguous(tl.multiple_of(rn1, BLOCK_N), BLOCK_N)
+    P_ = WORKSPACE + pid * BLOCK_M * BLOCK_N + rm1[:, None] * BLOCK_N + rn1[None, :]
+    tl.store(P_, 0.0, cache_modifier=".wt")  # Efficient scalar store like TritonBLAS
+    # Keep workspace zeroing visible before lock initialization.
+    tl.debug_barrier()
+    tl.store(LOCKS + pid, 0, cache_modifier=".wt")
+
+    tl.assume(pid >= 0)
+    iters_per_tile = tl.cdiv(K, BLOCK_K)
+    total_streamk_iters = STREAMK_TILES * iters_per_tile
+    streamk_iters_pcu = total_streamk_iters // NUM_SMS
+    streamk_remainder_iters = total_streamk_iters % NUM_SMS
+    start_iter = total_full_tiles * iters_per_tile + pid * streamk_iters_pcu + tl.minimum(pid, streamk_remainder_iters)
+    last_iter = total_full_tiles * iters_per_tile + (pid + 1) * streamk_iters_pcu + tl.minimum(pid + 1, streamk_remainder_iters)
+
+    # StreamK main loop
+    while start_iter < last_iter:
+        remainder = start_iter % iters_per_tile
+        end_iter = tl.minimum(start_iter + (iters_per_tile - remainder), last_iter)
+        tile_id = start_iter // iters_per_tile
+
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        {% if BIAS %}
+        bias_ = BIAS_PTR + rm * stride_bias
+        bias = tl.load(bias_, mask=rm < M, other=0.0)
+        {% endif %}
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+
+        {% if EVEN_K %}
+        if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)):
+            offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+        else:
+            offs_a_m = rm % M
+        if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)):
+            offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        else:
+            offs_b_n = rn % N
+        offs_k = tl.arange(0, BLOCK_K)
+
+        for current_iter in range(start_iter, end_iter):
+            k_offset = (current_iter % iters_per_tile) * BLOCK_K
+            a_k_offs = offs_k[None, :] + k_offset
+            b_k_offs = offs_k[:, None] + k_offset
+            a = tl.load(A + offs_a_m[:, None] * stride_am + a_k_offs * stride_ak)
+            b = tl.load(B + b_k_offs * stride_bk + offs_b_n[None, :] * stride_bn)
+            acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
+
+        {% else %}
+        rk = tl.arange(0, BLOCK_K)
+        A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak + BLOCK_K * stride_ak * remainder
+        B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn + BLOCK_K * stride_bk * remainder
+        if stride_ak == 1:
+            A_BASE = tl.multiple_of(A_BASE, (1, 16))
+        else:
+            A_BASE = tl.multiple_of(A_BASE, (16, 1))
+        if stride_bk == 1:
+            B_BASE = tl.multiple_of(B_BASE, (16, 1))
+        else:
+            B_BASE = tl.multiple_of(B_BASE, (1, 16))
+        mask_m = rm[:, None] < M
+        mask_n = rn[None, :] < N
+
+        for current_iter in range(start_iter, end_iter):
+            global_k_offset = (current_iter % iters_per_tile) * BLOCK_K
+            k_mask = global_k_offset + rk < K
+            if stride_ak == 1:
+                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), mask=mask_m & k_mask[None, :], other=0.0, cache_modifier=CACHE_MODIFIER_A)
+            else:
+                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), mask=mask_m & k_mask[None, :], other=0.0, cache_modifier=CACHE_MODIFIER_A)
+
+            if stride_bk == 1:
+                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), mask=mask_n & k_mask[:, None], other=0.0, cache_modifier=CACHE_MODIFIER_B)
+            else:
+                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), mask=mask_n & k_mask[:, None], other=0.0, cache_modifier=CACHE_MODIFIER_B)
+
+            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+            A_BASE += BLOCK_K * stride_ak
+            B_BASE += BLOCK_K * stride_bk
+        {% endif %}
+
+        {% if QUANTIZED %}
+        rm_A_scale = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn_B_scale = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        A_scale = tl.load(A_SCALE_PTR + rm_A_scale * stride_a_scale, mask=rm_A_scale < M, other=0.0)
+        B_scale = tl.load(B_SCALE_PTR + rn_B_scale * stride_b_scale, mask=rn_B_scale < N, other=0.0)
+        acc *= A_scale[:, None] * B_scale[None, :]
+        {% endif %}
+
+        tl.store(P_, acc, cache_modifier=".wt")
+        tl.debug_barrier()
+        tl.store(LOCKS + pid, 1, cache_modifier=".wt")
+
+        split_factor = NUM_SMS // tl.maximum(STREAMK_TILES, 1)
+        tile_local = pid % split_factor
+        tile_base = pid - tile_local
+
+        if split_factor > 1 and tile_local % 2 == 0:
+            partner = tile_base + tile_local + 1
+            if partner < NUM_SMS:
+                while tl.load(LOCKS + partner, cache_modifier=".cv", volatile=True) < 1:
+                    pass
+                rm1 = tl.arange(0, BLOCK_M)
+                rn1 = tl.arange(0, BLOCK_N)
+                rm1 = tl.max_contiguous(tl.multiple_of(rm1, BLOCK_M), BLOCK_M)
+                rn1 = tl.max_contiguous(tl.multiple_of(rn1, BLOCK_N), BLOCK_N)
+                P_partner = WORKSPACE + partner * BLOCK_M * BLOCK_N + rm1[:, None] * BLOCK_N + rn1[None, :]
+                acc += tl.load(P_partner, cache_modifier=".cv")
+                tl.store(P_, acc, cache_modifier=".wt")
+                tl.debug_barrier()
+                tl.store(LOCKS + pid, 2, cache_modifier=".wt")
+
+        if split_factor > 2 and tile_local % 4 == 0:
+            partner = tile_base + tile_local + 2
+            if partner < NUM_SMS:
+                while tl.load(LOCKS + partner, cache_modifier=".cv", volatile=True) < 2:
+                    pass
+                rm1 = tl.arange(0, BLOCK_M)
+                rn1 = tl.arange(0, BLOCK_N)
+                rm1 = tl.max_contiguous(tl.multiple_of(rm1, BLOCK_M), BLOCK_M)
+                rn1 = tl.max_contiguous(tl.multiple_of(rn1, BLOCK_N), BLOCK_N)
+                P_partner = WORKSPACE + partner * BLOCK_M * BLOCK_N + rm1[:, None] * BLOCK_N + rn1[None, :]
+                acc += tl.load(P_partner, cache_modifier=".cv")
+                tl.store(P_, acc, cache_modifier=".wt")
+                tl.debug_barrier()
+                tl.store(LOCKS + pid, 3, cache_modifier=".wt")
+
+        if split_factor > 4 and tile_local % 8 == 0:
+            partner = tile_base + tile_local + 4
+            if partner < NUM_SMS:
+                while tl.load(LOCKS + partner, cache_modifier=".cv", volatile=True) < 3:
+                    pass
+                rm1 = tl.arange(0, BLOCK_M)
+                rn1 = tl.arange(0, BLOCK_N)
+                rm1 = tl.max_contiguous(tl.multiple_of(rm1, BLOCK_M), BLOCK_M)
+                rn1 = tl.max_contiguous(tl.multiple_of(rn1, BLOCK_N), BLOCK_N)
+                P_partner = WORKSPACE + partner * BLOCK_M * BLOCK_N + rm1[:, None] * BLOCK_N + rn1[None, :]
+                acc += tl.load(P_partner, cache_modifier=".cv")
+                tl.store(P_, acc, cache_modifier=".wt")
+                tl.debug_barrier()
+                tl.store(LOCKS + pid, 4, cache_modifier=".wt")
+
+        if split_factor > 8 and tile_local % 16 == 0:
+            partner = tile_base + tile_local + 8
+            if partner < NUM_SMS:
+                while tl.load(LOCKS + partner, cache_modifier=".cv", volatile=True) < 4:
+                    pass
+                rm1 = tl.arange(0, BLOCK_M)
+                rn1 = tl.arange(0, BLOCK_N)
+                rm1 = tl.max_contiguous(tl.multiple_of(rm1, BLOCK_M), BLOCK_M)
+                rn1 = tl.max_contiguous(tl.multiple_of(rn1, BLOCK_N), BLOCK_N)
+                P_partner = WORKSPACE + partner * BLOCK_M * BLOCK_N + rm1[:, None] * BLOCK_N + rn1[None, :]
+                acc += tl.load(P_partner, cache_modifier=".cv")
+
+        if tile_local == 0:
+            {% if BIAS %}
+            acc += bias[:, None]
+            {% endif %}
+
+            c = acc.to({{dtype("C")}})
+            rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            mask = (rm[:, None] < M) & (rn[None, :] < N)
+            C_ = C_OUT + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+            tl.store(C_, c, mask=mask)
+
+        start_iter = end_iter
+"""
+
+_STREAMK_TEMPLATE_SOURCE = r"""
+__DEF_KERNEL__
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        return
+
+    C_OUT = {{ptr("C")}}
+    stride_am: tl.constexpr = {{stride("A", 0)}}
+    {% set k_size = size("A", 1)|int %}
+    {% if k_size >= 16 %}
+    stride_ak: tl.constexpr = {{stride("A", 1)}}
+    stride_bk: tl.constexpr = {{stride("B", 0)}}
+    {% else %}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    {% endif %}
+    stride_bn: tl.constexpr = {{stride("B", 1)}}
+    stride_cm = {{stride(None, 0)}}
+    stride_cn = {{stride(None, 1)}}
+
+    {% if BIAS %}
+    stride_bias: tl.constexpr = {{stride("BIAS_PTR", 0)}}
+    {% endif %}
+    {% if QUANTIZED %}
+    stride_a_scale: tl.constexpr = {{stride("A_SCALE_PTR", 0)}}
+    stride_b_scale: tl.constexpr = {{stride("B_SCALE_PTR", 0)}}
+    {% endif %}
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    pid = tl.program_id(0)
+    if NUM_XCDS != 1 and CHUNK_SIZE >= 1:
+        pid = triton_helpers.chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    total_tiles = num_pid_m * num_pid_n
+    total_full_tiles = total_tiles - STREAMK_TILES
+    acc_dtype = tl.float32
+
+    for tile_id in range(pid, total_full_tiles, NUM_SMS):
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        {% if BIAS %}
+        bias_ = BIAS_PTR + rm * stride_bias
+        bias = tl.load(bias_, mask=rm < M, other=0.0)
+        {% endif %}
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+
+        {% if EVEN_K %}
+        if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)):
+            offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+        else:
+            offs_a_m = rm % M
+        if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)):
+            offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        else:
+            offs_b_n = rn % N
+        offs_k = tl.arange(0, BLOCK_K)
+
+        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+            a_k_offs = offs_k[None, :] + (k_idx * BLOCK_K)
+            b_k_offs = offs_k[:, None] + (k_idx * BLOCK_K)
+            a = tl.load(A + offs_a_m[:, None] * stride_am + a_k_offs * stride_ak)
+            b = tl.load(B + b_k_offs * stride_bk + offs_b_n[None, :] * stride_bn)
+            acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
+        {% else %}
+        rk = tl.arange(0, BLOCK_K)
+        A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
+        B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        mask_m = rm[:, None] < M
+        mask_n = rn[None, :] < N
+
+        loop_k = tl.cdiv(K, BLOCK_K) - 1
+        for k in range(0, loop_k):
+            if stride_ak == 1:
+                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), mask=mask_m, other=0.0)
+            else:
+                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), mask=mask_m, other=0.0)
+            if stride_bk == 1:
+                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), mask=mask_n, other=0.0)
+            else:
+                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), mask=mask_n, other=0.0)
+            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+            A_BASE += BLOCK_K * stride_ak
+            B_BASE += BLOCK_K * stride_bk
+
+        rk_tail = loop_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        A_TAIL = A + rm[:, None] * stride_am + rk_tail[None, :] * stride_ak
+        B_TAIL = B + rk_tail[:, None] * stride_bk + rn[None, :] * stride_bn
+        if stride_ak == 1:
+            A_TAIL = tl.multiple_of(A_TAIL, (1, 16))
+        else:
+            A_TAIL = tl.multiple_of(A_TAIL, (16, 1))
+        if stride_bk == 1:
+            B_TAIL = tl.multiple_of(B_TAIL, (16, 1))
+        else:
+            B_TAIL = tl.multiple_of(B_TAIL, (1, 16))
+        a = tl.load(A_TAIL, mask=mask_m & (rk_tail[None, :] < K), other=0.0)
+        b = tl.load(B_TAIL, mask=mask_n & (rk_tail[:, None] < K), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+        {% endif %}
+
+        {% if QUANTIZED %}
+        rm_q = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn_q = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        A_scale = tl.load(A_SCALE_PTR + rm_q * stride_a_scale, mask=rm_q < M, other=0.0)
+        B_scale = tl.load(B_SCALE_PTR + rn_q * stride_b_scale, mask=rn_q < N, other=0.0)
+        acc *= A_scale[:, None] * B_scale[None, :]
+        {% endif %}
+
+        {% if BIAS %}
+        c = acc.to({{dtype("C")}}) + bias[:, None]
+        {% else %}
+        c = acc.to({{dtype("C")}})
+        {% endif %}
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (rm[:, None] < M) & (rn[None, :] < N)
+        C_ = C_OUT + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+        tl.store(C_, c, mask=mask)
+
+__STREAMK_PHASE__
+    dummy_idx_m = 0
+    dummy_idx_n = 0
+    dummy_mask = False
+    acc_dummy_scalar = tl.cast(0.0, dtype=acc_dtype)
+    {{store_output(("dummy_idx_m", "dummy_idx_n"), "acc_dummy_scalar", "dummy_mask")}}
+"""
+
+
+def _build_streamk_template_source(include_workspace_locks: bool) -> str:
+    return (
+        _STREAMK_TEMPLATE_SOURCE.replace(
+            "__DEF_KERNEL__",
+            (
+                _STREAMK_DEF_KERNEL_WITH_WORKSPACE
+                if include_workspace_locks
+                else _STREAMK_DEF_KERNEL_WITHOUT_WORKSPACE
+            ),
+        ).replace(
+            "__STREAMK_PHASE__",
+            _STREAMK_SPLIT_PHASE_SOURCE if include_workspace_locks else "",
+        )
+    )
+
+
+class _BaseStreamKTemplate(TritonTemplate):
+    requires_workspace_locks: bool
+
+    def __init__(self, name: str, include_workspace_locks: bool):
+        super().__init__(
+            name=name,
+            grid=streamk_mm_grid,
+            source=_build_streamk_template_source(include_workspace_locks),
+            cache_codegen_enabled_for_template=True,
+            prologue_loads_all_inputs=True,
+        )
+        self.requires_workspace_locks = include_workspace_locks
+
+    def maybe_append_choice(self, choices, **kwargs):
+        if not ENABLE_STREAMK:
+            return None
+
+        epilogue_fn = kwargs.get("epilogue_fn", None)
+        if epilogue_fn is not None and epilogue_fn is not identity:
+            streamk_log_debug(
+                "Skipping StreamK: epilogue fusion detected (not compatible with ptr('C'))"
+            )
+            return None
+
+        try:
+            input_nodes = kwargs.get("input_nodes", ())
+            if len(input_nodes) < 2:
+                raise ValueError(
+                    f"StreamK template requires at least 2 input nodes (A, B), got {len(input_nodes)}"
+                )
+
+            A_node, B_node = input_nodes[0], input_nodes[1]
+            bias_node = input_nodes[2] if len(input_nodes) > 2 else None
+            layout = kwargs.get("layout")
+
+            template_kwargs = dict(kwargs)
+            template_kwargs.pop("input_nodes", None)
+            template_kwargs.pop("layout", None)
+
+            is_quantized = self._detect_quantization(A_node, B_node, layout)
+            template_kwargs.setdefault("QUANTIZED", is_quantized)
+
+            has_bias = bias_node is not None
+            template_kwargs.setdefault("BIAS", has_bias)
+
+            num_sms = template_kwargs.get("NUM_SMS", 108)
+            block_m = template_kwargs.get("BLOCK_M", 128)
+            block_n = template_kwargs.get("BLOCK_N", 128)
+            streamk_tiles = int(template_kwargs.get("STREAMK_TILES", 0))
+            uses_workspace_locks = streamk_tiles > 0
+
+            if uses_workspace_locks != self.requires_workspace_locks:
+                raise ValueError(
+                    f"{self.name} received STREAMK_TILES={streamk_tiles}, "
+                    f"requires_workspace_locks={self.requires_workspace_locks}"
+                )
+
+            M = A_node.get_size()[0]
+            N = B_node.get_size()[1]
+            streamk_input_nodes = [A_node, B_node]
+            mutated_inputs = []
+            workspace_arg = None
+
+            if is_quantized:
+                a_scale = empty_strided([M], None, dtype=torch.float32, device=layout.device)
+                b_scale = empty_strided([N], None, dtype=torch.float32, device=layout.device)
+                streamk_input_nodes.extend((a_scale, b_scale))
+
+            if has_bias:
+                streamk_input_nodes.append(bias_node)
+
+            if uses_workspace_locks:
+                workspace_bytes = num_sms * block_m * block_n * 4
+                locks_bytes = num_sms * 4
+                workspace_arg = WorkspaceArg(
+                    count=workspace_bytes + locks_bytes,
+                    zero_mode=WorkspaceZeroMode.UNINITIALIZED,
+                    device=layout.device,
+                    outer_name=WorkspaceArg.unique_name(),
+                )
+                streamk_log_debug(
+                    "workspace arg bytes: workspace=%s locks=%s total=%s"
+                    % (workspace_bytes, locks_bytes, workspace_bytes + locks_bytes)
+                )
+
+            streamk_input_nodes = tuple(streamk_input_nodes)
+            template_kwargs.pop("epilogue_fn", None)
+            template_kwargs.pop("epilogue_fn_hash", None)
+
+            return super().maybe_append_choice(
+                choices,
+                input_nodes=streamk_input_nodes,
+                layout=layout,
+                mutated_inputs=mutated_inputs,
+                workspace_arg=workspace_arg,
+                epilogue_fn=identity,
+                epilogue_fn_hash=None,
+                allow_epilogue_fusion=False,
+                **template_kwargs,
+            )
+        except Exception as e:
+            streamk_log_debug(f"Failed to add StreamK choice: {e}")
+            if STREAMK_DEBUG:
+                import traceback
+
+                streamk_log_debug(traceback.format_exc())
+            return e
+
+    def _detect_quantization(self, A_node, B_node, layout):
+        a_dtype = A_node.get_dtype()
+        b_dtype = B_node.get_dtype()
+        output_dtype = layout.dtype
+
+        quantized_dtypes = {torch.int8, torch.uint8}
+        if hasattr(torch, "float8_e4m3fn"):
+            quantized_dtypes.add(torch.float8_e4m3fn)
+        if hasattr(torch, "float8_e5m2"):
+            quantized_dtypes.add(torch.float8_e5m2)
+
+        is_quantized = (
+            a_dtype in quantized_dtypes
+            or b_dtype in quantized_dtypes
+            or output_dtype in quantized_dtypes
+        )
+        if is_quantized:
+            streamk_log_debug(
+                f"Detected quantized operation: A={a_dtype}, B={b_dtype}, output={output_dtype}"
+            )
+        return is_quantized
+
+
+class StreamKSplitTemplate(_BaseStreamKTemplate):
+    def __init__(self):
+        super().__init__("mm_streamk_split", include_workspace_locks=True)
+
+
+class StreamKNoSplitTemplate(_BaseStreamKTemplate):
+    def __init__(self):
+        super().__init__("mm_streamk_nosplit", include_workspace_locks=False)
+
+
+mm_streamk_split_template = StreamKSplitTemplate()
+mm_streamk_nosplit_template = StreamKNoSplitTemplate()
+
+
+def _get_streamk_template(streamk_tiles: int) -> _BaseStreamKTemplate:
+    return (
+        mm_streamk_split_template
+        if int(streamk_tiles) > 0
+        else mm_streamk_nosplit_template
+    )
+
+
+def can_use_streamk(m, n, k, dtype, device):
+    """Return whether StreamK is supported for this mm instance."""
+
+    def is_symbolic(val):
+        try:
+            int(val)
+            return False
+        except (TypeError, ValueError):
+            val_str = str(val)
+            return (
+                hasattr(val, 'is_symbol')
+                or val_str.startswith('s')
+                or 'Symbol' in str(type(val))
+                or 'Expr' in str(type(val))
+                or any(c in val_str for c in ['s', 'Symbol', 'Expr', 'sympy'])
+            )
+
+    if is_symbolic(m) or is_symbolic(n) or is_symbolic(k):
+        streamk_log_info(
+            f"Symbolic variables detected ({m}x{n}x{k}). StreamK is disabled for this compilation."
+        )
+        streamk_log_debug(f"Variable types: m={type(m)}, n={type(n)}, k={type(k)}")
+        return False
+
+    if str(device).startswith('mtia'):
+        streamk_log_debug(f"MTIA device ({device}) detected; skipping StreamK for {m}x{n}x{k}")
+        return False
+
+    if not torch.cuda.is_available():
+        streamk_log_info(f"CUDA not available; skipping StreamK for {m}x{n}x{k}")
+        return False
+
+    streamk_log_debug(f"StreamK supported for {m}x{n}x{k} (dtype={dtype})")
+    return True
+
 
 mm_template = TritonTemplate(
     name="mm",
@@ -727,6 +1958,9 @@ def tuned_mm(mat1, mat2, *, layout=None):
     """
     # TODO(coconutruben): integrate into MMKernelInputs when all callsites use that
     m, n, k, layout, mat1, mat2 = mm_args(mat1, mat2, layout=layout)
+
+    streamk_log_debug(f"tuned_mm entered for {m}x{n}x{k}")
+    streamk_log_info(f"Entering tuned_mm for {m}x{n}x{k}")
     static_shape, is_nonzero = _is_static_problem(layout)
     name = "mm"
 
@@ -751,6 +1985,11 @@ def tuned_mm(mat1, mat2, *, layout=None):
             device=layout.device, dtype=layout.dtype, size=layout.size
         )
     choices: list[ChoiceCaller] = []
+
+    # Initialize StreamK usage flag
+    streamk_supported = False
+
+    # Always generate autotuning choices for competition (unless explicitly disabled)
     if use_aten_gemm_kernels():
         choices.extend(
             V.choices.get_mm_configs(kernel_inputs, aten_layout, [aten_mm], "mm")
@@ -782,21 +2021,136 @@ def tuned_mm(mat1, mat2, *, layout=None):
             )
         )
 
+    # Add StreamK as a normal mm candidate when enabled and supported.
+    if static_shape and is_nonzero and ENABLE_STREAMK:
+        streamk_supported = can_use_streamk(m, n, k, mat1.get_dtype(), layout.device)
+
+        if streamk_supported:
+            if STREAMK_ONLY:
+                streamk_log_info(f"TORCHINDUCTOR_STREAMK_ONLY=1: using only the StreamK candidate for {m}x{n}x{k}")
+                choices = []
+            else:
+                log.info(f"Adding StreamK candidate for {m}x{n}x{k}")
+
+        if streamk_supported:
+            streamk_log_info(f"StreamK competing for {m}x{n}x{k} {mat1.get_dtype()}")
+
+            try:
+                # Use origami selector following tritonBLAS pattern
+                # selector = _make_matmul_selector(M, N, K, a.dtype, b.dtype, c.dtype)
+                selector = _make_streamk_selector(
+                    m, n, k,
+                    mat1.get_dtype(),
+                    mat2.get_dtype(),
+                    layout.dtype,  # c_dtype
+                    str(layout.device)  # device_type as string
+                )
+
+                # Get optimal configuration from selector
+                optimal_config = selector.get_config()
+                optimal_grid = selector.get_grid()
+
+                streamk_log_info(f"Selected StreamK config: "
+                                f"BLOCK_M={optimal_config['BLOCK_M']}, "
+                                f"BLOCK_N={optimal_config['BLOCK_N']}, "
+                                f"BLOCK_K={optimal_config['BLOCK_K']}, "
+                                f"STREAMK_TILES={optimal_config['STREAMK_TILES']}")
+
+                # Create the Origami-selected StreamK competitor plus any
+                # optional StreamK autotune variants.
+                streamk_choices = []
+                try:
+                    streamk_configs = [dict(optimal_config)]
+                    streamk_configs.extend(_get_streamk_autotune_configs(optimal_config))
+                    streamk_log_debug(
+                        f"Adding {len(streamk_configs)} StreamK competitor configs"
+                    )
+
+                    for config_idx, streamk_config in enumerate(streamk_configs):
+                        streamk_choice_config = dict(streamk_config)
+                        num_warps = streamk_choice_config.pop(
+                            "num_warps", 8
+                        )  # tritonBLAS default
+                        num_stages = streamk_choice_config.pop(
+                            "num_stages", 2
+                        )  # tritonBLAS default
+                        choice_label = (
+                            "origami"
+                            if config_idx == 0
+                            else f"autotune_{config_idx}"
+                        )
+                        streamk_template = _get_streamk_template(
+                            int(streamk_choice_config.get("STREAMK_TILES", 0))
+                        )
+                        streamk_log_debug(
+                            f"Adding StreamK competitor choice ({choice_label}) with template {streamk_template.name}: "
+                            f"{streamk_choice_config}, num_warps={num_warps}, num_stages={num_stages}"
+                        )
+
+                        error = streamk_template.maybe_append_choice(
+                            streamk_choices,
+                            input_nodes=(kernel_inputs.nodes()[0], kernel_inputs.nodes()[1]),  # Just A and B
+                            layout=layout,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                            **streamk_choice_config
+                        )
+
+                        if error is not None:
+                            streamk_log_debug(
+                                f"StreamK choice generation failed for {choice_label}: {error}"
+                            )
+                        else:
+                            streamk_log_info(
+                                f"StreamK choice created ({choice_label})"
+                            )
+
+                except Exception as e:
+                    streamk_log_debug(f"StreamK choice creation failed: {e}")
+                    if STREAMK_DEBUG:
+                        import traceback
+                        streamk_log_debug(f"   Full traceback: {traceback.format_exc()}")
+                    streamk_choices = []
+
+                # Add StreamK competitor to the choice pool for autotuning competition
+                choices_before = len(choices)
+                choices.extend(streamk_choices)
+
+                if len(streamk_choices) > 0:
+                    streamk_log_info(f"StreamK added as competitor "
+                                    f"(total choices: {len(choices)}, mm+autotuned: {choices_before}, streamk: {len(streamk_choices)})")
+                    streamk_log_info(f"Autotuning will benchmark StreamK against other mm choices")
+                else:
+                    streamk_log_info(f"Failed to add StreamK competitor; autotuning will use mm choices only")
+
+            except Exception as e:
+                streamk_log_info(f"StreamK competitor setup failed: {e}")
+                if "truth value of Relational" in str(e) or "cannot determine truth value" in str(e):
+                    streamk_log_info(f"Symbolic variable error detected in origami selector.")
+                streamk_log_info(f"   Autotuning will proceed with mm choices only")
+
+        streamk_log_info(f"StreamK candidate setup completed for {m}x{n}x{k}")
+    else:
+        if STREAMK_DEBUG:
+            streamk_log_info(f"StreamK was not added as a candidate for {m}x{n}x{k} (supported={streamk_supported})")
+            streamk_log_info("   Autotuning will proceed with non-StreamK choices only")
+
     if (
         is_nonzero
         and use_cutlass_template(layout, m, n, k)
         and _use_cutlass_for_op("mm")
+        and not STREAMK_ONLY
     ):
         CUTLASS3xGemmTemplate.add_cutlass_gemm_choices(
             choices, layout, kernel_inputs.nodes()
         )
 
-    if is_nonzero and use_ck_gemm_template(layout, m, n, k):
+    if is_nonzero and use_ck_gemm_template(layout, m, n, k) and not STREAMK_ONLY:
         CKGemmTemplate.add_ck_gemm_choices(choices, layout, kernel_inputs.nodes())
-    if is_nonzero and use_ck_tile_gemm_template(layout, m, n, k):
+    if is_nonzero and use_ck_tile_gemm_template(layout, m, n, k) and not STREAMK_ONLY:
         CKTileGemmTemplate.add_choices(choices, layout, kernel_inputs.nodes())
 
-    if use_cpp_gemm_template(layout, mat1, mat2):
+    if use_cpp_gemm_template(layout, mat1, mat2) and not STREAMK_ONLY:
         CppGemmTemplate.add_choices(
             choices,
             layout,
@@ -863,13 +2217,82 @@ def tuned_mm(mat1, mat2, *, layout=None):
     if torch._inductor.config.remote_gemm_autotune_cache:
         best_config_future = gen_best_config(mat1, mat2)
 
-    return autotune_select_algorithm(
+    # Safety check for experimental modes
+    if STREAMK_ONLY and len(choices) == 0:
+        streamk_log_info(f"No choices generated for {m}x{n}x{k} in StreamK-only mode")
+        streamk_log_info(f"   This might indicate StreamK config generation failed or symbolic shapes detected.")
+        streamk_log_info(f"   Adding a fallback choice to prevent crash...")
+
+        # Detailed debugging for why no choices were generated
+        streamk_log_info(f"Debugging why no choices were generated:")
+        streamk_log_info(f"   Problem size: {m}×{n}×{k}")
+        streamk_log_info(f"   Mat1 dtype: {mat1.get_dtype()}, Mat2 dtype: {mat2.get_dtype()}")
+        streamk_log_info(f"   Device: {layout.device}")
+        streamk_log_info(f"   TORCHINDUCTOR_STREAMK_ONLY: {STREAMK_ONLY}")
+        streamk_log_info(f"   streamk_supported was: {streamk_supported}")
+        streamk_log_info(f"   Layout: {layout}")
+
+        # Check whether StreamK is supported for this case
+        try:
+            would_use_streamk = can_use_streamk(m, n, k, mat1.get_dtype(), layout.device)
+            streamk_log_info(f"   can_use_streamk check: {would_use_streamk}")
+        except Exception as e:
+            streamk_log_info(f"   can_use_streamk check failed: {e}")
+
+
+        # Add a basic fallback to prevent complete failure
+        if use_aten_gemm_kernels():
+            try:
+                fallback_choices = list(V.choices.get_mm_configs(kernel_inputs, layout, [aten_mm], "mm"))
+                choices.extend(fallback_choices)
+                streamk_log_info(f"   Added {len(fallback_choices)} fallback choices")
+            except Exception as e:
+                streamk_log_info(f"   Fallback choice generation also failed: {e}")
+                streamk_log_info(f"   This might be due to symbolic variables affecting all choice generation.")
+
+    # Log final choice summary for StreamK debugging
+    log_choices_summary(choices, f"{m}x{n}x{k} GEMM")
+
+    streamk_log_debug(f"Final autotuning for {m}x{n}x{k} with {len(choices)} total choices")
+
+    # Enhanced logging to track which template gets selected
+    if STREAMK_DEBUG:
+        streamk_log_info(f"Choice details for {m}x{n}x{k}:")
+        for i, choice in enumerate(choices):
+            choice_name = getattr(choice, 'name', str(type(choice).__name__))
+            choice_template = getattr(choice, 'template', None)
+            if choice_template:
+                template_name = getattr(choice_template, 'name', 'unknown')
+                if 'streamk' in template_name.lower():
+                    streamk_log_info(f"  choice {i}: {choice_name} (streamk template: {template_name})")
+                else:
+                    streamk_log_info(f"  choice {i}: {choice_name} (template: {template_name})")
+            else:
+                streamk_log_info(f"  choice {i}: {choice_name} (no template info)")
+
+    result = autotune_select_algorithm(
         name,
         choices,
         kernel_inputs.nodes(),
         layout,
         best_config_future=best_config_future,
     )
+
+    # Log which choice was actually selected
+    if STREAMK_DEBUG and hasattr(result, 'choice'):
+        selected_choice = result.choice
+        choice_name = getattr(selected_choice, 'name', str(type(selected_choice).__name__))
+        choice_template = getattr(selected_choice, 'template', None)
+        if choice_template:
+            template_name = getattr(choice_template, 'name', 'unknown')
+            if 'streamk' in template_name.lower():
+                streamk_log_info(f"Selected StreamK: {choice_name} with template {template_name}")
+            else:
+                streamk_log_info(f"Selected non-StreamK: {choice_name} with template {template_name}")
+        else:
+            streamk_log_info(f"Selected: {choice_name} (no template info)")
+
+    return result
 
 
 @register_lowering(aten._int_mm, type_promotion_kind=None)
