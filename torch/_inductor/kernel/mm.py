@@ -1153,41 +1153,29 @@ _STREAMK_SPLIT_PHASE_SOURCE = r"""
             k_offset = (current_iter % iters_per_tile) * BLOCK_K
             a_k_offs = offs_k[None, :] + k_offset
             b_k_offs = offs_k[:, None] + k_offset
-            a = tl.load(A + offs_a_m[:, None] * stride_am + a_k_offs * stride_ak)
-            b = tl.load(B + b_k_offs * stride_bk + offs_b_n[None, :] * stride_bn)
+            idx_m = offs_a_m[:, None]
+            idx_n = a_k_offs
+            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"))}}
+            idx_m = b_k_offs
+            idx_n = offs_b_n[None, :]
+            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"))}}
             acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
 
         {% else %}
         rk = tl.arange(0, BLOCK_K)
-        A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak + BLOCK_K * stride_ak * remainder
-        B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn + BLOCK_K * stride_bk * remainder
-        if stride_ak == 1:
-            A_BASE = tl.multiple_of(A_BASE, (1, 16))
-        else:
-            A_BASE = tl.multiple_of(A_BASE, (16, 1))
-        if stride_bk == 1:
-            B_BASE = tl.multiple_of(B_BASE, (16, 1))
-        else:
-            B_BASE = tl.multiple_of(B_BASE, (1, 16))
         mask_m = rm[:, None] < M
         mask_n = rn[None, :] < N
 
         for current_iter in range(start_iter, end_iter):
             global_k_offset = (current_iter % iters_per_tile) * BLOCK_K
             k_mask = global_k_offset + rk < K
-            if stride_ak == 1:
-                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), mask=mask_m & k_mask[None, :], other=0.0, cache_modifier=CACHE_MODIFIER_A)
-            else:
-                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), mask=mask_m & k_mask[None, :], other=0.0, cache_modifier=CACHE_MODIFIER_A)
-
-            if stride_bk == 1:
-                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), mask=mask_n & k_mask[:, None], other=0.0, cache_modifier=CACHE_MODIFIER_B)
-            else:
-                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), mask=mask_n & k_mask[:, None], other=0.0, cache_modifier=CACHE_MODIFIER_B)
-
+            idx_m = rm[:, None]
+            idx_n = global_k_offset + rk[None, :]
+            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & k_mask[None, :]", index_shape=("BLOCK_M", "BLOCK_K"))}}
+            idx_m = global_k_offset + rk[:, None]
+            idx_n = rn[None, :]
+            {{load_input("B", "b", ("idx_m", "idx_n"), mask="k_mask[:, None] & mask_n", index_shape=("BLOCK_K", "BLOCK_N"))}}
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-            A_BASE += BLOCK_K * stride_ak
-            B_BASE += BLOCK_K * stride_bk
         {% endif %}
 
         {% if QUANTIZED %}
@@ -1315,44 +1303,29 @@ __DEF_KERNEL__
         for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
             a_k_offs = offs_k[None, :] + (k_idx * BLOCK_K)
             b_k_offs = offs_k[:, None] + (k_idx * BLOCK_K)
-            a = tl.load(A + offs_a_m[:, None] * stride_am + a_k_offs * stride_ak)
-            b = tl.load(B + b_k_offs * stride_bk + offs_b_n[None, :] * stride_bn)
+            idx_m = offs_a_m[:, None]
+            idx_n = a_k_offs
+            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"))}}
+            idx_m = b_k_offs
+            idx_n = offs_b_n[None, :]
+            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"))}}
             acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
         {% else %}
-        rk = tl.arange(0, BLOCK_K)
-        A_BASE = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        offs_k = tl.arange(0, BLOCK_K)
         mask_m = rm[:, None] < M
         mask_n = rn[None, :] < N
 
         loop_k = tl.cdiv(K, BLOCK_K) - 1
         for k in range(0, loop_k):
-            if stride_ak == 1:
-                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), mask=mask_m, other=0.0)
-            else:
-                a = tl.load(tl.multiple_of(A_BASE, (16, 1)), mask=mask_m, other=0.0)
-            if stride_bk == 1:
-                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), mask=mask_n, other=0.0)
-            else:
-                b = tl.load(tl.multiple_of(B_BASE, (1, 16)), mask=mask_n, other=0.0)
+            a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+            b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+            idx_m = rm[:, None]
+            idx_n = offs_k[None, :] + k_idx * BLOCK_K
+            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & a_mask", index_shape=("BLOCK_M", "BLOCK_K"))}}
+            idx_m = offs_k[:, None] + k_idx * BLOCK_K
+            idx_n = rn[None, :]
+            {{load_input("B", "b", ("idx_m", "idx_n"), mask="b_mask & mask_n", index_shape=("BLOCK_K", "BLOCK_N"))}}
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-            A_BASE += BLOCK_K * stride_ak
-            B_BASE += BLOCK_K * stride_bk
-
-        rk_tail = loop_k * BLOCK_K + tl.arange(0, BLOCK_K)
-        A_TAIL = A + rm[:, None] * stride_am + rk_tail[None, :] * stride_ak
-        B_TAIL = B + rk_tail[:, None] * stride_bk + rn[None, :] * stride_bn
-        if stride_ak == 1:
-            A_TAIL = tl.multiple_of(A_TAIL, (1, 16))
-        else:
-            A_TAIL = tl.multiple_of(A_TAIL, (16, 1))
-        if stride_bk == 1:
-            B_TAIL = tl.multiple_of(B_TAIL, (16, 1))
-        else:
-            B_TAIL = tl.multiple_of(B_TAIL, (1, 16))
-        a = tl.load(A_TAIL, mask=mask_m & (rk_tail[None, :] < K), other=0.0)
-        b = tl.load(B_TAIL, mask=mask_n & (rk_tail[:, None] < K), other=0.0)
-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
         {% endif %}
 
         {% if QUANTIZED %}
