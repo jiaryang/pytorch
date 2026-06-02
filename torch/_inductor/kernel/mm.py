@@ -1305,10 +1305,10 @@ __DEF_KERNEL__
             b_k_offs = offs_k[:, None] + (k_idx * BLOCK_K)
             idx_m = offs_a_m[:, None]
             idx_n = a_k_offs
-            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"), indent_width=8)}}
+            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"), indent_width=12)}}
             idx_m = b_k_offs
             idx_n = offs_b_n[None, :]
-            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"), indent_width=8)}}
+            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"), indent_width=12)}}
             acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
         {% else %}
         offs_k = tl.arange(0, BLOCK_K)
@@ -1320,10 +1320,10 @@ __DEF_KERNEL__
             b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
             idx_m = rm[:, None]
             idx_n = offs_k[None, :] + k_idx * BLOCK_K
-            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & a_mask", index_shape=("BLOCK_M", "BLOCK_K"), indent_width=8)}}
+            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & a_mask", index_shape=("BLOCK_M", "BLOCK_K"), indent_width=12)}}
             idx_m = offs_k[:, None] + k_idx * BLOCK_K
             idx_n = rn[None, :]
-            {{load_input("B", "b", ("idx_m", "idx_n"), mask="b_mask & mask_n", index_shape=("BLOCK_K", "BLOCK_N"), indent_width=8)}}
+            {{load_input("B", "b", ("idx_m", "idx_n"), mask="b_mask & mask_n", index_shape=("BLOCK_K", "BLOCK_N"), indent_width=12)}}
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
         {% endif %}
 
