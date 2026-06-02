@@ -1153,12 +1153,8 @@ _STREAMK_SPLIT_PHASE_SOURCE = r"""
             k_offset = (current_iter % iters_per_tile) * BLOCK_K
             a_k_offs = offs_k[None, :] + k_offset
             b_k_offs = offs_k[:, None] + k_offset
-            idx_m = offs_a_m[:, None]
-            idx_n = a_k_offs
-            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"))}}
-            idx_m = b_k_offs
-            idx_n = offs_b_n[None, :]
-            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"))}}
+            a = tl.load(A + offs_a_m[:, None] * stride_am + a_k_offs * stride_ak)
+            b = tl.load(B + b_k_offs * stride_bk + offs_b_n[None, :] * stride_bn)
             acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
 
         {% else %}
@@ -1169,12 +1165,16 @@ _STREAMK_SPLIT_PHASE_SOURCE = r"""
         for current_iter in range(start_iter, end_iter):
             global_k_offset = (current_iter % iters_per_tile) * BLOCK_K
             k_mask = global_k_offset + rk < K
-            idx_m = rm[:, None]
-            idx_n = global_k_offset + rk[None, :]
-            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & k_mask[None, :]", index_shape=("BLOCK_M", "BLOCK_K"))}}
-            idx_m = global_k_offset + rk[:, None]
-            idx_n = rn[None, :]
-            {{load_input("B", "b", ("idx_m", "idx_n"), mask="k_mask[:, None] & mask_n", index_shape=("BLOCK_K", "BLOCK_N"))}}
+            a = tl.load(
+                A + rm[:, None] * stride_am + (global_k_offset + rk[None, :]) * stride_ak,
+                mask=mask_m & k_mask[None, :],
+                other=0.0,
+            )
+            b = tl.load(
+                B + (global_k_offset + rk[:, None]) * stride_bk + rn[None, :] * stride_bn,
+                mask=k_mask[:, None] & mask_n,
+                other=0.0,
+            )
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
         {% endif %}
 
@@ -1305,26 +1305,25 @@ __DEF_KERNEL__
             b_k_offs = offs_k[:, None] + (k_idx * BLOCK_K)
             idx_m = offs_a_m[:, None]
             idx_n = a_k_offs
-            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"))}}
+            {{load_input("A", "a", ("idx_m", "idx_n"), index_shape=("BLOCK_M", "BLOCK_K"), indent_width=8)}}
             idx_m = b_k_offs
             idx_n = offs_b_n[None, :]
-            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"))}}
+            {{load_input("B", "b", ("idx_m", "idx_n"), index_shape=("BLOCK_K", "BLOCK_N"), indent_width=8)}}
             acc = tl.dot(a, b, acc, allow_tf32=ALLOW_TF32, out_dtype=acc_dtype)
         {% else %}
         offs_k = tl.arange(0, BLOCK_K)
         mask_m = rm[:, None] < M
         mask_n = rn[None, :] < N
 
-        loop_k = tl.cdiv(K, BLOCK_K) - 1
-        for k in range(0, loop_k):
+        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
             a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
             b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
             idx_m = rm[:, None]
             idx_n = offs_k[None, :] + k_idx * BLOCK_K
-            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & a_mask", index_shape=("BLOCK_M", "BLOCK_K"))}}
+            {{load_input("A", "a", ("idx_m", "idx_n"), mask="mask_m & a_mask", index_shape=("BLOCK_M", "BLOCK_K"), indent_width=8)}}
             idx_m = offs_k[:, None] + k_idx * BLOCK_K
             idx_n = rn[None, :]
-            {{load_input("B", "b", ("idx_m", "idx_n"), mask="b_mask & mask_n", index_shape=("BLOCK_K", "BLOCK_N"))}}
+            {{load_input("B", "b", ("idx_m", "idx_n"), mask="b_mask & mask_n", index_shape=("BLOCK_K", "BLOCK_N"), indent_width=8)}}
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
         {% endif %}
 
